@@ -37,6 +37,7 @@
 #include <curl/curl.h>
 #include "compat.h"
 #include "miner.h"
+#include "fpga_sha.h"
 
 #define PROGRAM_NAME		"minerd"
 #define LP_SCANTIME		60
@@ -1277,6 +1278,164 @@ out:
 	return NULL;
 }
 
+static void *fpga_miner_thread(void *userdata)
+{
+    struct thr_info *mythr = userdata;
+    int thr_id = mythr->id;
+    struct work work = {{0}};
+    uint32_t max_nonce;
+    uint32_t end_nonce = 0xffffffffU / opt_n_threads * (thr_id + 1) - 0x20;
+    unsigned char *scratchbuf = NULL;
+    char s[16];
+    int i;
+
+    /* Set worker threads to nice 19 and then preferentially to SCHED_IDLE
+     * and if that fails, then SCHED_BATCH. No need for this to be an
+     * error if it fails */
+    if (!opt_benchmark) {
+        setpriority(PRIO_PROCESS, 0, 19);
+        drop_policy();
+    }
+
+    /* Cpu affinity only makes sense if the number of threads is a multiple
+     * of the number of CPUs */
+    if (num_processors > 1 && opt_n_threads % num_processors == 0) {
+        if (!opt_quiet)
+            applog(LOG_INFO, "Binding thread %d to cpu %d",
+                   thr_id, thr_id % num_processors);
+        affine_to_cpu(thr_id, thr_id % num_processors);
+    }
+
+    if (opt_algo == ALGO_SCRYPT) {
+        applog(LOG_ERR, "FPGA doesn't support scrypt algo");
+        scratchbuf = scrypt_buffer_alloc(opt_scrypt_n);
+        if (!scratchbuf) {
+            applog(LOG_ERR, "scrypt buffer allocation failed");
+            pthread_mutex_lock(&applog_lock);
+            exit(1);
+        }
+    }
+
+    while (1) {
+        unsigned long hashes_done;
+        struct timeval tv_start, tv_end, diff;
+        int64_t max64;
+        int rc;
+
+        if (have_stratum) {
+            while (time(NULL) >= g_work_time + 120)
+                sleep(1);
+            pthread_mutex_lock(&g_work_lock);
+            if (work.data[19] >= end_nonce && !memcmp(work.data, g_work.data, 76))
+                stratum_gen_work(&stratum, &g_work);
+        } else {
+            int min_scantime = have_longpoll ? LP_SCANTIME : opt_scantime;
+            /* obtain new work from internal workio thread */
+            pthread_mutex_lock(&g_work_lock);
+            if (!have_stratum &&
+                (time(NULL) - g_work_time >= min_scantime ||
+                 work.data[19] >= end_nonce)) {
+                work_free(&g_work);
+                if (unlikely(!get_work(mythr, &g_work))) {
+                    applog(LOG_ERR, "work retrieval failed, exiting "
+                                    "mining thread %d", mythr->id);
+                    pthread_mutex_unlock(&g_work_lock);
+                    goto out;
+                }
+                g_work_time = have_stratum ? 0 : time(NULL);
+            }
+            if (have_stratum) {
+                pthread_mutex_unlock(&g_work_lock);
+                continue;
+            }
+        }
+        if (memcmp(work.data, g_work.data, 76)) {
+            work_free(&work);
+            work_copy(&work, &g_work);
+            work.data[19] = 0xffffffffU / opt_n_threads * thr_id;
+        } else
+            work.data[19]++;
+        pthread_mutex_unlock(&g_work_lock);
+        work_restart[thr_id].restart = 0;
+
+        /* adjust max_nonce to meet target scan time */
+        if (have_stratum)
+            max64 = LP_SCANTIME;
+        else
+            max64 = g_work_time + (have_longpoll ? LP_SCANTIME : opt_scantime)
+                    - time(NULL);
+        max64 *= thr_hashrates[thr_id];
+        if (max64 <= 0) {
+            switch (opt_algo) {
+                case ALGO_SCRYPT:
+                    max64 = opt_scrypt_n < 16 ? 0x3ffff : 0x3fffff / opt_scrypt_n;
+                    break;
+                case ALGO_SHA256D:
+                    max64 = 0x1fffff;
+                    break;
+            }
+        }
+        if (work.data[19] + max64 > end_nonce)
+            max_nonce = end_nonce;
+        else
+            max_nonce = work.data[19] + max64;
+
+        hashes_done = 0;
+        gettimeofday(&tv_start, NULL);
+
+        /* scan nonces for a proof-of-work hash */
+        switch (opt_algo) {
+            case ALGO_SCRYPT:
+                rc = scanhash_scrypt(thr_id, work.data, scratchbuf, work.target,
+                                     max_nonce, &hashes_done, opt_scrypt_n);
+                break;
+
+            case ALGO_SHA256D:
+                rc = fpga_scanhash_sha256d(thr_id, work.data, work.target,
+                                      max_nonce, &hashes_done);
+                break;
+
+            default:
+                /* should never happen */
+                goto out;
+        }
+
+        /* record scanhash elapsed time */
+        gettimeofday(&tv_end, NULL);
+        timeval_subtract(&diff, &tv_end, &tv_start);
+        if (diff.tv_usec || diff.tv_sec) {
+            pthread_mutex_lock(&stats_lock);
+            thr_hashrates[thr_id] =
+                    hashes_done / (diff.tv_sec + 1e-6 * diff.tv_usec);
+            pthread_mutex_unlock(&stats_lock);
+        }
+        if (!opt_quiet) {
+            sprintf(s, thr_hashrates[thr_id] >= 1e6 ? "%.0f" : "%.2f",
+                    1e-3 * thr_hashrates[thr_id]);
+            applog(LOG_INFO, "thread %d: %lu hashes, %s khash/s",
+                   thr_id, hashes_done, s);
+        }
+        if (opt_benchmark && thr_id == opt_n_threads - 1) {
+            double hashrate = 0.;
+            for (i = 0; i < opt_n_threads && thr_hashrates[i]; i++)
+                hashrate += thr_hashrates[i];
+            if (i == opt_n_threads) {
+                sprintf(s, hashrate >= 1e6 ? "%.0f" : "%.2f", 1e-3 * hashrate);
+                applog(LOG_INFO, "Total: %s khash/s", s);
+            }
+        }
+
+        /* if nonce found, submit work */
+        if (rc && !opt_benchmark && !submit_work(mythr, &work))
+            break;
+    }
+
+    out:
+    tq_freeze(mythr->q);
+
+    return NULL;
+}
+
 static void restart_threads(void)
 {
 	int i;
@@ -2010,10 +2169,20 @@ int main(int argc, char *argv[])
 		if (!thr->q)
 			return 1;
 
-		if (unlikely(pthread_create(&thr->pth, NULL, miner_thread, thr))) {
-			applog(LOG_ERR, "thread %d create failed", i);
-			return 1;
-		}
+        // ECE 382N FPGA Miner: Always start thread0 on the FPGA
+        // Extra threads will use the default CPU miner
+        if(i == 0) {
+            fpga_setup();
+            if (unlikely(pthread_create(&thr->pth, NULL, fpga_miner_thread, thr))) {
+                applog(LOG_ERR, "thread %d create failed", i);
+                return 1;
+            }
+        } else {
+            if (unlikely(pthread_create(&thr->pth, NULL, miner_thread, thr))) {
+                applog(LOG_ERR, "thread %d create failed", i);
+                return 1;
+            }
+        }
 	}
 
 	applog(LOG_INFO, "%d miner threads started, "
