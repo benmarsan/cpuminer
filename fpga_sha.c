@@ -379,12 +379,6 @@ int fpga_scanhash_sha256d(int thr_id, uint32_t *pdata, const uint32_t *ptarget,
     }
     printf("\r\n");
 
-    printf("Input header data (LEHex): ");
-    for(int i = 0; i < 20; i++) {
-        printf("%08x", htobe32(pdata[i]));
-    }
-    printf("\r\n");
-
     printf("Input target: ");
     for(int i = 0; i < 8*4; i++) {
         printf("%02x ", ((uint8_t *)ptarget)[i]);
@@ -397,12 +391,6 @@ int fpga_scanhash_sha256d(int thr_id, uint32_t *pdata, const uint32_t *ptarget,
     }
     printf("\r\n");
 
-    printf("Input target (LEHex): ");
-    for(int i = 0; i < 8; i++) {
-        printf("%08x", htobe32(ptarget[i]));
-    }
-    printf("\r\n");
-
     uint32_t target_be[8];
     char target_str[65];
 
@@ -410,8 +398,7 @@ int fpga_scanhash_sha256d(int thr_id, uint32_t *pdata, const uint32_t *ptarget,
         be32enc(target_be + i, ptarget[7 - i]);
     }
     bin2hex(target_str, (unsigned char *)target_be, 32);
-
-    printf("fpga_sha target real str: %s\r\n", target_str);
+    printf("fpga_sha target: %s\r\n", target_str);
 
     *Control = 0;
     // Reset device
@@ -445,7 +432,7 @@ int fpga_scanhash_sha256d(int thr_id, uint32_t *pdata, const uint32_t *ptarget,
             // TODO: Get actual number of hashes completed
             *hashes_done = max_nonce - first_nonce + 1;
 
-            uint32_t nonce_from_fpga = htobe32(*Nonce); // TODO: Do we need to swap the nonce output from FPGA?
+            uint32_t nonce_from_fpga = *Nonce;
             pdata[19] = nonce_from_fpga;
             printf("Nonce from fpga: 0x%08x\r\n", nonce_from_fpga);
 
@@ -477,8 +464,6 @@ int fpga_scanhash_sha256d(int thr_id, uint32_t *pdata, const uint32_t *ptarget,
                 return 1;
             }
             printf("Error! Accelerator reported false positive!\r\n");
-            // TODO: Remove this once it works
-            exit(-1);
             return 0;
         } else if (*Control & (1 << 12)) {
             printf("Exhausted possible nonce values\r\n");
