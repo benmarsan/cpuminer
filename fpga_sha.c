@@ -416,10 +416,8 @@ int fpga_scanhash_sha256d(int thr_id, uint32_t *pdata, const uint32_t *ptarget,
 
     // Handle block header
     for (size_t i = 0; i < 80/4; i++) {
-        // Header in from pdata is already byte-swapped, we probably don't need to swap again
-        // TODO: Verify ^
+        // Header in from pdata is already byte-swapped, we don't need to swap again
         Header[i] = pdata[i];
-        // Header[i] = htobe32(pdata[i]);
     }
 
     // set bit 0 to start mining
@@ -428,11 +426,10 @@ int fpga_scanhash_sha256d(int thr_id, uint32_t *pdata, const uint32_t *ptarget,
     do {
         // Poll to check if accelerator has finished
         if (*Control & (1 << 8)) {
-            printf("Found valid nonce: 0x%08x\r\n", *Nonce);
-            // TODO: Get actual number of hashes completed
-            *hashes_done = max_nonce - first_nonce + 1;
-
             uint32_t nonce_from_fpga = *Nonce;
+            printf("Found valid nonce: 0x%08x\r\n", nonce_from_fpga);
+            *hashes_done = (nonce_from_fpga % (286331153)) * 15;
+
             pdata[19] = nonce_from_fpga;
             printf("Nonce from fpga: 0x%08x\r\n", nonce_from_fpga);
 
@@ -448,7 +445,7 @@ int fpga_scanhash_sha256d(int thr_id, uint32_t *pdata, const uint32_t *ptarget,
             }
             printf("\r\n");
 
-            // TODO: Check full hash validity again in software
+            // Check if hash is indeed valid
             memcpy(data, pdata + 16, 64);
             sha256d_preextend(data);
             sha256_init(midstate);
@@ -460,14 +457,14 @@ int fpga_scanhash_sha256d(int thr_id, uint32_t *pdata, const uint32_t *ptarget,
             pdata[19] = data[3];
             sha256d_80_swap(hash, pdata);
             if (fulltest(hash, ptarget)) {
-                *hashes_done = n - first_nonce + 1;
+                printf("Hash from FPGA meets target!\r\n");
                 return 1;
             }
             printf("Error! Accelerator reported false positive!\r\n");
             return 0;
         } else if (*Control & (1 << 12)) {
             printf("Exhausted possible nonce values\r\n");
-            *hashes_done = max_nonce - first_nonce + 1;
+            *hashes_done = 4294967295; // 2^32-1
             return 0;
         }
 
@@ -477,33 +474,7 @@ int fpga_scanhash_sha256d(int thr_id, uint32_t *pdata, const uint32_t *ptarget,
     // Stop mining
     *Control &= ~(1 << 0);
 
-    // TODO: Get number of hashes completed
-    *hashes_done = 0;
+    *hashes_done = (*Nonce % (286331153)) * 15;
     pdata[19] = *Nonce;
     return 0;
-
-//    memcpy(data, pdata + 16, 64);
-//    sha256d_preextend(data);
-//
-//    sha256_init(midstate);
-//    sha256_transform(midstate, pdata, 0);
-//    memcpy(prehash, midstate, 32);
-//    sha256d_prehash(prehash, pdata + 16);
-//
-//    do {
-//        data[3] = ++n;
-//        sha256d_ms(hash, data, midstate, prehash);
-//        if (swab32(hash[7]) <= Htarg) {
-//            pdata[19] = data[3];
-//            sha256d_80_swap(hash, pdata);
-//            if (fulltest(hash, ptarget)) {
-//                *hashes_done = n - first_nonce + 1;
-//                return 1;
-//            }
-//        }
-//    } while (n < max_nonce && !work_restart[thr_id].restart);
-//
-//    *hashes_done = n - first_nonce + 1;
-//    pdata[19] = n;
-//    return 0;
 }
